@@ -1,7 +1,12 @@
 package ru.yandexpraktikum.blechat.data.bluetooth
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothGatt
+import android.bluetooth.BluetoothGattCallback
+import android.bluetooth.BluetoothGattCharacteristic
+import android.bluetooth.BluetoothProfile
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
 import android.content.Context
@@ -16,9 +21,15 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
 import ru.yandexpraktikum.blechat.domain.bluetooth.BleClientController
 import ru.yandexpraktikum.blechat.domain.model.ScannedBluetoothDevice
+import ru.yandexpraktikum.blechat.presentation.notifications.NotificationsHelper
 import ru.yandexpraktikum.blechat.utils.checkForConnectPermission
+import ru.yandexpraktikum.blechat.utils.notifyCharUUID
+import ru.yandexpraktikum.blechat.utils.serviceUUID
+import ru.yandexpraktikum.blechat.utils.writeCharUUID
+import java.nio.charset.Charset
 import javax.inject.Inject
 
 class BleClientControllerImpl @Inject constructor(
@@ -26,7 +37,10 @@ class BleClientControllerImpl @Inject constructor(
     private val bluetoothAdapter: BluetoothAdapter?,
     private val locationManager: LocationManager,
     private val viewModelScope: CoroutineScope,
-): BleClientController {
+    private val notificationsHelper: NotificationsHelper,
+) : BleClientController {
+
+    private var currentGatt: BluetoothGatt? = null
 
     private val bleScanner by lazy {
         bluetoothAdapter?.bluetoothLeScanner
@@ -40,11 +54,85 @@ class BleClientControllerImpl @Inject constructor(
     override val isLocationEnabled: StateFlow<Boolean>
         get() = _isLocationEnabled.asStateFlow()
 
-
     init {
         updateBluetoothState()
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
             updateLocationState()
+        }
+    }
+
+    private val gattCallback = object : BluetoothGattCallback() {
+        override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+            super.onConnectionStateChange(gatt, status, newState)
+            when (newState) {
+                BluetoothProfile.STATE_CONNECTED -> {
+                    context.checkForConnectPermission {
+                        gatt.discoverServices()
+                    }
+                    _scannedDevices.update { devices ->
+                        devices.map { scannedDevice ->
+                            if (scannedDevice.address == gatt.device.address) {
+                                scannedDevice.copy(isConnected = true)
+                            } else {
+                                scannedDevice
+                            }
+                        }
+                    }
+                }
+                BluetoothProfile.STATE_DISCONNECTED -> {
+                    _scannedDevices.update { devices ->
+                        devices.map { scannedDevice ->
+                            if (scannedDevice.address == gatt.device.address) {
+                                scannedDevice.copy(isConnected = false)
+                            } else {
+                                scannedDevice
+                            }
+                        }
+                    }
+                    closeConnection()
+                }
+            }
+        }
+
+        override fun onServicesDiscovered(gatt: BluetoothGatt?, status: Int) {
+            super.onServicesDiscovered(gatt, status)
+            if (status == BluetoothGatt.GATT_SUCCESS && gatt != null) {
+                val service = gatt.getService(serviceUUID)
+                val characteristic = service?.getCharacteristic(notifyCharUUID)
+                if (characteristic != null) {
+                    context.checkForConnectPermission {
+                        gatt.setCharacteristicNotification(characteristic, true)
+                    }
+                }
+            }
+        }
+
+        @Deprecated("Deprecated in Java")
+        override fun onCharacteristicChanged(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+        ) {
+            super.onCharacteristicChanged(gatt, characteristic)
+            val messageText = String(characteristic.value ?: byteArrayOf(), Charset.defaultCharset())
+            viewModelScope.launch {
+                _scannedDevices.update { devices ->
+                    devices.map { scannedDevice ->
+                        if (scannedDevice.address == gatt.device.address) {
+                            scannedDevice.addRemoteMessage(
+                                text = messageText,
+                                senderAddress = gatt.device.address
+                            )
+                        } else {
+                            scannedDevice
+                        }
+                    }
+                }
+                var title = gatt.device.address
+                context.checkForConnectPermission {
+                    gatt.device.name?.let { name -> title = name }
+                }
+                notificationsHelper.notifyOnMessageReceived(title, messageText)
+            }
         }
     }
 
@@ -146,15 +234,50 @@ class BleClientControllerImpl @Inject constructor(
     }
 
     override fun connectToDevice(device: ScannedBluetoothDevice): Boolean {
-        TODO()
+        context.checkForConnectPermission {
+            val remoteDevice = bluetoothAdapter?.getRemoteDevice(device.address)
+            currentGatt = remoteDevice?.connectGatt(context, false, gattCallback)
+        }
+        return currentGatt != null
     }
 
+    @SuppressLint("HardwareIds")
     override suspend fun sendMessage(message: String, deviceAddress: String): Boolean {
-        TODO()
+        val service = currentGatt?.getService(serviceUUID) ?: return false
+        val characteristic = service.getCharacteristic(writeCharUUID) ?: return false
+
+        @Suppress("DEPRECATION")
+        characteristic.value = message.toByteArray(Charset.defaultCharset())
+
+        var success = false
+        context.checkForConnectPermission {
+            @Suppress("DEPRECATION")
+            success = currentGatt?.writeCharacteristic(characteristic) == true
+        }
+
+        if (success) {
+            _scannedDevices.update { devices ->
+                devices.map { scannedDevice ->
+                    if (scannedDevice.address == deviceAddress) {
+                        scannedDevice.addLocalMessage(
+                            text = message,
+                            localAddress = bluetoothAdapter?.address
+                        )
+                    } else {
+                        scannedDevice
+                    }
+                }
+            }
+        }
+        return success
     }
 
     override fun closeConnection() {
-        TODO()
+        context.checkForConnectPermission {
+            currentGatt?.disconnect()
+            currentGatt?.close()
+        }
+        currentGatt = null
     }
 
     override fun release() {
